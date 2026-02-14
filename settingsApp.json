@@ -1,0 +1,14 @@
+{
+  "database": {
+    "host": "localhost",
+    "user": "root",
+    "password": "password",
+    "database": "social_media_db",
+    "port": 3306
+  },
+  "api": {
+    "title": "Social Media Content Generator API",
+    "version": "1.0.0",
+    "description": "API para generar contenido estructurado para redes sociales usando LLMs"
+  }
+}

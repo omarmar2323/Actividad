@@ -1,0 +1,42 @@
+# Entorno virtual
+.venv/
+venv/
+env/
+
+# Archivos de Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Archivos de IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db
+
+# Bases de datos
+*.db
+*.sqlite
+
+# Logs
+*.log
+
+# Archivos de configuración sensibles (comentar si se quiere incluir)
+# settingsLLM.json
+# settingsApp.json
+
+# Archivos de prueba
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Dependencias
+dist/
+build/
+*.egg-info/
