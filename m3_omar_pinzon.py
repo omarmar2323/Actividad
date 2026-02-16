@@ -5,6 +5,8 @@ Aplicación FastAPI para generar contenido estructurado para redes sociales usan
 
 import json
 import os
+import uuid
+import re
 from typing import Optional, List
 from datetime import datetime
 from contextlib import contextmanager
@@ -14,7 +16,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, Column, String, DateTime, Integer, func, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
-from openai import AzureOpenAI
+from openai import OpenAI
 
 
 # ======================
@@ -46,6 +48,7 @@ dbConnectionString: str = (
 Base = declarative_base()
 
 
+
 class SocialMediaPostModel(Base):
     """Modelo de base de datos para posts de redes sociales."""
     __tablename__ = "social_media_posts"
@@ -56,7 +59,7 @@ class SocialMediaPostModel(Base):
     tone = Column(String(50), nullable=False)
     content = Column(Text, nullable=False)
     hashtags = Column(Text, nullable=True)
-    link = Column(String(500), nullable=True)
+    link = Column(String(500), nullable=False)  # SIEMPRE requerido
     createdAt = Column(DateTime, default=datetime.utcnow, server_default=func.now())
 
 
@@ -71,7 +74,7 @@ class SocialMediaPostSchema(BaseModel):
     tone: str = Field(..., min_length=1, max_length=50)
     content: str = Field(..., min_length=1)
     hashtags: Optional[str] = None
-    link: Optional[str] = None
+    link: str = Field(..., min_length=1, description="Enlace siempre generado por el LLM (real o fake)")
 
     class Config:
         from_attributes = True
@@ -85,7 +88,7 @@ class SocialMediaPostSchemas(BaseModel):
     tone: str
     content: str
     hashtags: Optional[str] = None
-    link: Optional[str] = None
+    link: str
     createdAt: datetime
 
     class Config:
@@ -93,9 +96,17 @@ class SocialMediaPostSchemas(BaseModel):
 
 
 class GeneratePostRequest(BaseModel):
-    """Schema para solicitud de generación de contenido."""
-    prompt: str = Field(..., min_length=10)
-    platform: str = Field(default="X", min_length=1, max_length=50)
+    """Schema para solicitud de generación de contenido.
+    
+    Solo requiere el prompt. La plataforma se especifica dentro del prompt.
+    Por defecto es 'X' si no se especifica en el prompt.
+    """
+    prompt: str = Field(
+        ..., 
+        min_length=10, 
+        description="Descripción del contenido a generar. Puede incluir la plataforma destino",
+        json_schema_extra={"example": "Crea un post motivacional sobre programación para LinkedIn"}
+    )
 
 
 # ======================
@@ -109,27 +120,70 @@ app = FastAPI(
 )
 
 # Engine y sesión de base de datos
-engine = create_engine(dbConnectionString, echo=False)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+engine = None
+SessionLocal = None
 
-# Crear tablas si no existen
-Base.metadata.create_all(bind=engine)
+def initializeDatabase() -> None:
+    """Inicializa la conexión a la base de datos."""
+    global engine, SessionLocal
+    if engine is None:
+        engine = create_engine(dbConnectionString, echo=False)
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        # Crear tablas si no existen
+        Base.metadata.create_all(bind=engine)
 
-# Cliente de Azure OpenAI
-azureOpenAIClient = AzureOpenAI(
-    api_key=llmConfig["openai"]["api_key"],
-    api_version=llmConfig["openai"]["api_version"],
-    azure_endpoint=llmConfig["openai"]["endpoint"]
-)
+# Inicializar base de datos al arrancar la aplicación
+@app.on_event("startup")
+async def startupEvent():
+    """Event que se ejecuta al iniciar la aplicación."""
+    initializeDatabase()
+
+# Cliente de OpenAI (compatible con Azure y Ollama local)
+llmEndpoint: str = llmConfig["openai"]["endpoint"]
+llmApiKey: str = llmConfig["openai"]["api_key"]
+
+# Si el endpoint contiene 'localhost' u 'openai.azure.com', usar el cliente apropiado
+if "localhost" in llmEndpoint or "192.168" in llmEndpoint or "127.0.0.1" in llmEndpoint:
+    # Ollama local o similar - usar OpenAI con base_url
+    openaiClient = OpenAI(
+        api_key=llmApiKey,
+        base_url=llmEndpoint
+    )
+else:
+    # Azure OpenAI - usar base_url para compatibilidad
+    openaiClient = OpenAI(
+        api_key=llmApiKey,
+        base_url=llmEndpoint
+    )
 
 
 # ======================
 # Funciones auxiliares
 # ======================
 
+def generateFakeLink(title: str) -> str:
+    """Genera un enlace fake basado en el título del post.
+    
+    Args:
+        title: Título del post
+    
+    Returns:
+        URL fake con formato https://resources.example.com/{slug}
+    """
+    # Convertir el título a slug (minúsculas, sin espacios/caracteres especiales)
+    slug = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')
+    # Limitar a 50 caracteres
+    slug = slug[:50]
+    # Generar URL fake
+    uniqueId = str(uuid.uuid4())[:8]
+    return f"https://resources.example.com/{slug}-{uniqueId}"
+
+
 @contextmanager
 def getDbSession():
     """Context manager para manejo de sesiones de base de datos."""
+    if SessionLocal is None:
+        raise RuntimeError("Database not initialized. Call initializeDatabase() first.")
     dbSession: Session = SessionLocal()
     try:
         yield dbSession
@@ -141,43 +195,54 @@ def getDbSession():
         dbSession.close()
 
 
-def generateSocialMediaContent(prompt: str, platform: str) -> SocialMediaPostSchema:
+def generateSocialMediaContent(prompt: str) -> tuple:
     """
     Genera contenido para redes sociales usando Azure OpenAI.
+    El LLM identifica la plataforma del prompt. Si no la especifica, usa "X" por defecto.
     
     Args:
-        prompt: Descripción del contenido a generar
-        platform: Plataforma de red social (X, LinkedIn, Facebook, etc.)
+        prompt: Descripción del contenido a generar (puede incluir la plataforma destino)
     
     Returns:
-        SocialMediaPostSchema: Post generado con estructura JSON
+        tuple: (SocialMediaPostSchema generado, plataforma identificada)
     """
     modelParams = llmConfig.get("model_parameters", {})
     
-    systemPrompt = f"""Eres un experto en generación de contenido para redes sociales. 
-Debes generar contenido estructurado para la plataforma {platform}.
+    systemPrompt = """Eres un experto en generación de contenido para redes sociales.
+Analizarás el prompt para identificar la plataforma de red social destino (X, LinkedIn, Facebook, Instagram, TikTok, etc.).
+Si la plataforma NO está especificada claramente, usa "X" como plataforma por defecto.
+
 Responde SIEMPRE en formato JSON válido con esta estructura exacta:
-{{
+{
+    "platform": "plataforma identificada (X, LinkedIn, Facebook, etc.)",
     "title": "título o tema del artículo",
     "tone": "estilo (formal, informal, divertido)",
     "content": "contenido del post",
     "hashtags": "hashtags separados por espacios",
-    "link": "enlace a recurso externo (opcional)"
-}}
-No incluyas markdown ni caracteres especiales en el JSON."""
+    "link": "enlace a recurso externo (REQUERIDO - genera uno relevante al contenido si no tienes uno real)"
+}
+No incluyas markdown ni caracteres especiales en el JSON.
+Importante: Siempre incluye el campo "platform" en la respuesta.
+IMPRESCINDIBLE: El campo "link" NUNCA debe estar vacío o null. Si no conoces un link real, genera uno fake basado en el tema del post (ej: https://blog.example.com/tema-del-post)."""
 
-    response = azureOpenAIClient.chat.completions.create(
-        model=llmConfig["openai"]["deployment_name"],
-        messages=[
-            {"role": "system", "content": systemPrompt},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=modelParams.get("temperature", 0.7),
-        max_tokens=modelParams.get("max_tokens", 1500),
-        top_p=modelParams.get("top_p", 0.95),
-        frequency_penalty=modelParams.get("frequency_penalty", 0.0),
-        presence_penalty=modelParams.get("presence_penalty", 0.0)
-    )
+    try:
+        response = openaiClient.chat.completions.create(
+            model=llmConfig["openai"]["deployment_name"],
+            messages=[
+                {"role": "system", "content": systemPrompt},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=modelParams.get("temperature", 0.7),
+            max_tokens=modelParams.get("max_tokens", 1500),
+            top_p=modelParams.get("top_p", 0.95),
+            frequency_penalty=modelParams.get("frequency_penalty", 0.0),
+            presence_penalty=modelParams.get("presence_penalty", 0.0)
+        )
+    except Exception as connError:
+        raise ConnectionError(
+            f"Error de conexión con el LLM. Endpoint: {llmEndpoint} | Modelo: {llmConfig['openai']['deployment_name']} | "
+            f"Detalles: {str(connError)}"
+        )
     
     # Extraer el contenido de la respuesta
     responseContent: str = response.choices[0].message.content
@@ -194,20 +259,37 @@ No incluyas markdown ni caracteres especiales en el JSON."""
             generatedData: dict = json.loads(responseContent)
     except json.JSONDecodeError:
         generatedData: dict = {
+            "platform": "X",
             "title": "Error en generación",
             "tone": "neutral",
             "content": responseContent,
             "hashtags": "",
-            "link": None
+            "link": generateFakeLink("Error en generación")
         }
     
-    return SocialMediaPostSchema(
-        platform=platform,
-        title=generatedData.get("title", "Sin título"),
-        tone=generatedData.get("tone", "neutral"),
-        content=generatedData.get("content", ""),
-        hashtags=generatedData.get("hashtags", ""),
-        link=generatedData.get("link")
+    # Extraer la plataforma del JSON generado
+    detectedPlatform: str = generatedData.get("platform", "X")
+    if not detectedPlatform or detectedPlatform.strip() == "":
+        detectedPlatform = "X"
+    
+    # Extraer y validar el link (NUNCA debe estar vacío)
+    generatedTitle: str = generatedData.get("title", "Sin título")
+    generatedLink: str = generatedData.get("link", "")
+    
+    # Si el link está vacío o es None, generar uno fake
+    if not generatedLink or generatedLink.strip() == "":
+        generatedLink = generateFakeLink(generatedTitle)
+    
+    return (
+        SocialMediaPostSchema(
+            platform=detectedPlatform,
+            title=generatedTitle,
+            tone=generatedData.get("tone", "neutral"),
+            content=generatedData.get("content", ""),
+            hashtags=generatedData.get("hashtags", ""),
+            link=generatedLink
+        ),
+        detectedPlatform
     )
 
 
@@ -270,10 +352,19 @@ async def createContent(postData: SocialMediaPostSchema) -> SocialMediaPostSchem
 
 @app.post("/api/contents/generate", response_model=SocialMediaPostSchemas, tags=["Posts"])
 async def generateContent(request: GeneratePostRequest) -> SocialMediaPostSchemas:
-    """Genera un nuevo post usando un LLM basado en un prompt."""
+    """
+    Genera un nuevo post usando un LLM basado en un prompt.
+    
+    El LLM identificará la plataforma del prompt.
+    Si la plataforma no está especificada en el prompt, usa "X" por defecto.
+    
+    Ejemplos:
+    - Con plataforma explícita: "Crea un post sobre IA para LinkedIn"
+    - Sin plataforma (por defecto X): "Crea un post sobre IA"
+    """
     try:
-        # Generar contenido usando Azure OpenAI
-        generatedPost = generateSocialMediaContent(request.prompt, request.platform)
+        # Generar contenido usando el LLM (el LLM identifica la plataforma)
+        generatedPost, _ = generateSocialMediaContent(request.prompt)
         
         # Guardar en base de datos
         with getDbSession() as dbSession:
@@ -290,6 +381,11 @@ async def generateContent(request: GeneratePostRequest) -> SocialMediaPostSchema
             
             return SocialMediaPostSchemas.from_orm(newPost)
     
+    except ConnectionError as connErr:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"LLM no disponible: {str(connErr)}"
+        )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

@@ -1,9 +1,9 @@
 {
   "database": {
-    "host": "localhost",
-    "user": "root",
-    "password": "password",
-    "database": "social_media_db",
+    "host": "<HOST>",
+    "user": "<USER>",
+    "password": "<PASSWORD>",
+    "database": "<DATABASE>",
     "port": 3306
   },
   "api": {
