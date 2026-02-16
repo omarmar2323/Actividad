@@ -138,23 +138,14 @@ async def startupEvent():
     """Event que se ejecuta al iniciar la aplicación."""
     initializeDatabase()
 
-# Cliente de OpenAI (compatible con Azure y Ollama local)
+# Cliente de OpenAI universal (compatible con Azure, Ollama, OpenAI directo)
 llmEndpoint: str = llmConfig["openai"]["endpoint"]
 llmApiKey: str = llmConfig["openai"]["api_key"]
 
-# Si el endpoint contiene 'localhost' u 'openai.azure.com', usar el cliente apropiado
-if "localhost" in llmEndpoint or "192.168" in llmEndpoint or "127.0.0.1" in llmEndpoint:
-    # Ollama local o similar - usar OpenAI con base_url
-    openaiClient = OpenAI(
-        api_key=llmApiKey,
-        base_url=llmEndpoint
-    )
-else:
-    # Azure OpenAI - usar base_url para compatibilidad
-    openaiClient = OpenAI(
-        api_key=llmApiKey,
-        base_url=llmEndpoint
-    )
+openaiClient = OpenAI(
+    api_key=llmApiKey,
+    base_url=llmEndpoint
+)
 
 
 # ======================
